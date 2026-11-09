@@ -7,6 +7,8 @@ on:
 
 env:
   COMPOSE_FILE: docker-compose.prod.yml
+  MM_VERSION: v12.0.1
+  MA_URL: https://github.com/mattermost/migration-assist/releases/latest/download/migration-assist-Linux-x86_64.tar.gz
 
 jobs:
   migrate-and-deploy:
@@ -14,28 +16,27 @@ jobs:
     env:
       MYSQL_ROOT_PASSWORD: ${{ secrets.DB_MYSQL_ROOT_PASSWORD }}
       DB_POSTGRES_PASSWORD: ${{ secrets.DB_POSTGRES_PASSWORD }}
+      MYSQL_DSN: root:${{ secrets.DB_MYSQL_ROOT_PASSWORD }}@tcp(mattermost-mysql:3306)/mattermost
+      PG_DSN: postgres://postgres:${{ secrets.DB_POSTGRES_PASSWORD }}@mattermost-postgres:5432/mattermost?sslmode=disable
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      # 1. Идемпотентность: выполнялась ли миграция ранее?
       - name: Check Migration Status
         id: check_status
         run: |
           if [ -f "$HOME/.mattermost_migration_completed" ]; then
-            echo "✅ Already migrated to PostgreSQL. Skipping backup and data transfer."
+            echo "✅ Already migrated. Skipping backup and data transfer."
             echo "already_migrated=true" >> "$GITHUB_OUTPUT"
           else
             echo "⚠️ Migration required."
             echo "already_migrated=false" >> "$GITHUB_OUTPUT"
           fi
 
-      # 2. Останавливаем старое приложение, чтобы данные не менялись во время переноса
       - name: Stop legacy Mattermost
         if: steps.check_status.outputs.already_migrated == 'false'
         run: docker stop mattermost || true
 
-      # 3. Бэкап MySQL
       - name: Backup Legacy MySQL
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
@@ -50,60 +51,76 @@ jobs:
           test -s "$BACKUP"
           echo "✅ Backup saved: $BACKUP"
 
-      # 4. Поднимаем PostgreSQL и ждём готовности
+      - name: Download migration-assist
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          mkdir -p "$RUNNER_TEMP/ma"
+          curl -fsSL "$MA_URL" | tar -xz -C "$RUNNER_TEMP/ma"
+          ls -la "$RUNNER_TEMP/ma"
+
       - name: Start Target PostgreSQL
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
           docker compose -f "$COMPOSE_FILE" up -d db-postgres
           for i in $(seq 1 30); do
-            if docker exec mattermost-postgres pg_isready -U postgres -d mattermost; then exit 0; fi
+            if docker exec mattermost-postgres pg_isready -U postgres; then exit 0; fi
             sleep 2
           done
           echo "❌ PostgreSQL did not become ready"
           exit 1
 
-      # 5. Чистим схему mattermost, оставшуюся от прерванного запуска
-      - name: Prepare target schema
+      # Идемпотентность: каждый запуск начинает с чистой БД
+      - name: Recreate target database
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
-          docker exec mattermost-postgres psql -U postgres -d mattermost -v ON_ERROR_STOP=1 \
-            -c "DROP SCHEMA IF EXISTS mattermost CASCADE;"
+          docker exec mattermost-postgres psql -U postgres -d postgres -v ON_ERROR_STOP=1 \
+            -c "DROP DATABASE IF EXISTS mattermost WITH (FORCE);" \
+            -c "CREATE DATABASE mattermost;"
 
-      # 6. Миграция pgloader (include drop = устойчивость к перезапускам)
+      - name: Check MySQL schema
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker run --rm --network=mattermost_network -v "$RUNNER_TEMP/ma:/ma:ro" alpine:3.20 \
+            /ma/migration-assist mysql "$MYSQL_DSN" --fix-artifacts --fix-unicode --fix-varchar
+
+      - name: Create PostgreSQL schema (official migrations)
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker run --rm --network=mattermost_network -v "$RUNNER_TEMP/ma:/ma:ro" alpine:3.20 \
+            /ma/migration-assist postgres "$PG_DSN" --run-migrations --mattermost-version="$MM_VERSION"
+
+      - name: Generate pgloader config
+        if: steps.check_status.outputs.already_migrated == 'false'
+        run: |
+          docker run --rm --network=mattermost_network -v "$RUNNER_TEMP/ma:/ma:ro" alpine:3.20 \
+            /ma/migration-assist pgloader --mysql="$MYSQL_DSN" --postgres="$PG_DSN" --remove-null-chars \
+            > "$RUNNER_TEMP/migration.load"
+          test -s "$RUNNER_TEMP/migration.load"
+
       - name: Run pgloader
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
-          docker run --rm --network=mattermost_network mattermost/mattermost-pgloader:latest pgloader \
-            --with "include drop" \
-            "mysql://root:${MYSQL_ROOT_PASSWORD}@mattermost-mysql/mattermost" \
-            "postgresql://postgres:${DB_POSTGRES_PASSWORD}@mattermost-postgres/mattermost"
+          docker run --rm --network=mattermost_network -v "$RUNNER_TEMP:/work" \
+            mattermost/mattermost-pgloader:latest pgloader /work/migration.load
 
-      # 7. pgloader кладёт таблицы в схему mattermost, а Mattermost ждёт public
-      - name: Move tables to public schema
+      - name: Post-migrate (indexes)
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
-          docker exec -i mattermost-postgres psql -U postgres -d mattermost -v ON_ERROR_STOP=1 <<'SQL'
-          BEGIN;
-          DROP SCHEMA public CASCADE;
-          ALTER SCHEMA mattermost RENAME TO public;
-          COMMIT;
-          SQL
+          docker run --rm --network=mattermost_network -v "$RUNNER_TEMP/ma:/ma:ro" alpine:3.20 \
+            /ma/migration-assist postgres post-migrate --create-indexes "$PG_DSN"
 
-      # 8. Удаляем legacy-контейнеры и ставим флаг (в одном шаге, чтобы не было промежуточного состояния)
       - name: Remove legacy containers & mark completed
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
+          rm -f "$RUNNER_TEMP/migration.load"
           docker rm -f mattermost mattermost-mysql || true
           touch "$HOME/.mattermost_migration_completed"
-          echo "✅ Migration marked as completed"
 
-      # 9. Деплой продакшн-стека
       - name: Deploy Upgraded Stack
         run: |
           docker compose -f "$COMPOSE_FILE" up -d --remove-orphans
           docker compose -f "$COMPOSE_FILE" ps
 
-      # 10. Проверка работоспособности
       - name: Health Check
         run: |
           for i in $(seq 1 60); do
@@ -119,7 +136,6 @@ jobs:
           docker compose -f "$COMPOSE_FILE" logs --tail 80
           exit 1
 
-      # 11. Проверка сохранности данных
       - name: Verify data
         run: |
           docker exec mattermost-postgres psql -U postgres -d mattermost -tA -c \
