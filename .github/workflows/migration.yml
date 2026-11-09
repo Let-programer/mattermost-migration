@@ -88,8 +88,8 @@ jobs:
       - name: Create PostgreSQL schema (official migrations)
         if: steps.check_status.outputs.already_migrated == 'false'
         run: |
-          docker run --rm --network=mattermost_network -v "$RUNNER_TEMP/ma:/ma:ro" alpine:3.20 \
-            /ma/migration-assist postgres "$PG_DSN" --run-migrations --mattermost-version="$MM_VERSION"
+          docker run --rm --network=mattermost_network -e PG_DSN -e MM_VERSION -v "$RUNNER_TEMP/ma:/ma:ro" alpine:3.20 \
+            sh -c 'apk add --no-cache git >/dev/null && /ma/migration-assist postgres "$PG_DSN" --run-migrations --mattermost-version="$MM_VERSION"'
 
       - name: Generate pgloader config
         if: steps.check_status.outputs.already_migrated == 'false'
